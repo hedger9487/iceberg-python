@@ -876,6 +876,127 @@ class _OverwriteFiles(_SnapshotProducer["_OverwriteFiles"]):
             raise ValidationException(f"Missing required files to delete: {', '.join(sorted(missing))}")
 
 
+class _RewriteManifests(_SnapshotProducer["_RewriteManifests"]):
+    """Rewrites manifest files for a table to optimize metadata.
+
+    This produces a REPLACE snapshot.
+    """
+
+    _manifest_predicate: Callable[[ManifestFile], bool] | None
+    _target_size_bytes: int
+
+    def __init__(
+        self,
+        transaction: Transaction,
+        io: FileIO,
+        commit_uuid: uuid.UUID | None = None,
+        snapshot_properties: dict[str, str] = EMPTY_DICT,
+        branch: str | None = MAIN_BRANCH,
+    ) -> None:
+        from pyiceberg.table import TableProperties
+
+        super().__init__(Operation.REPLACE, transaction, io, commit_uuid, snapshot_properties, branch)
+        self._manifest_predicate = None
+        table_properties = self._transaction.table_metadata.properties
+        self._target_size_bytes = property_as_int(
+            table_properties,
+            TableProperties.MANIFEST_TARGET_SIZE_BYTES,
+            TableProperties.MANIFEST_TARGET_SIZE_BYTES_DEFAULT,
+        )  # type: ignore
+
+    def rewrite_if(self, predicate: Callable[[ManifestFile], bool]) -> _RewriteManifests:
+        """Filter which manifests should be rewritten.
+
+        Args:
+            predicate: A function that takes a ManifestFile and returns True if it should be rewritten.
+
+        Returns:
+            This _RewriteManifests instance for method chaining.
+        """
+        self._manifest_predicate = predicate
+        return self
+
+    def _validate_concurrency(self) -> None:
+        """Validate concurrency for rewrite manifests."""
+        if self._parent_snapshot_id is None:
+            raise ValidationException("Cannot rewrite manifests on a table with no snapshots")
+
+    def _existing_manifests(self) -> list[ManifestFile]:
+        """Return the existing manifests from the target branch snapshot."""
+        if self._parent_snapshot_id is None:
+            raise ValidationException("Cannot rewrite manifests on a table with no snapshots")
+
+        previous_snapshot = self._transaction.table_metadata.snapshot_by_id(self._parent_snapshot_id)
+        if previous_snapshot is None:
+            raise ValidationException(f"Snapshot could not be found: {self._parent_snapshot_id}")
+
+        return list(previous_snapshot.manifests(io=self._io))
+
+    def _deleted_entries(self) -> list[ManifestEntry]:
+        return []
+
+    def _create_manifest(self, spec_id: int, manifest_bin: list[ManifestFile]) -> ManifestFile:
+        with self.new_manifest_writer(spec=self.spec(spec_id)) as writer:
+            for manifest in manifest_bin:
+                for entry in self.fetch_manifest_entry(manifest=manifest, discard_deleted=False):
+                    if entry.status != ManifestEntryStatus.DELETED:
+                        writer.existing(entry)
+
+        return writer.to_manifest_file()
+
+    def _validate_files_counts(self, created_manifests: list[ManifestFile], replaced_manifests: list[ManifestFile]) -> None:
+        def active_files_count(manifests: list[ManifestFile]) -> int:
+            count = 0
+            for manifest in manifests:
+                count += (manifest.added_files_count or 0) + (manifest.existing_files_count or 0)
+            return count
+
+        created_files_count = active_files_count(created_manifests)
+        replaced_files_count = active_files_count(replaced_manifests)
+        if created_files_count != replaced_files_count:
+            raise ValidationException(
+                f"Replaced and created manifests must have the same number of active files: "
+                f"{created_files_count} (new), {replaced_files_count} (old)"
+            )
+
+    def _process_manifests(self, manifests: list[ManifestFile]) -> list[ManifestFile]:
+        """Process and rewrite manifests matching predicate."""
+        to_rewrite: list[ManifestFile] = []
+        to_keep: list[ManifestFile] = []
+
+        for manifest in manifests:
+            if manifest.content == ManifestContent.DATA and (
+                self._manifest_predicate is None or self._manifest_predicate(manifest)
+            ):
+                to_rewrite.append(manifest)
+            else:
+                to_keep.append(manifest)
+
+        if not to_rewrite:
+            return manifests
+
+        groups: dict[int, list[ManifestFile]] = defaultdict(list)
+        for manifest in to_rewrite:
+            groups[manifest.partition_spec_id].append(manifest)
+
+        packer: ListPacker[ManifestFile] = ListPacker(target_weight=self._target_size_bytes, lookback=1, largest_bin_first=False)
+
+        def merge_bin(spec_id: int, manifest_bin: list[ManifestFile]) -> ManifestFile:
+            return self._create_manifest(spec_id, manifest_bin)
+
+        executor = ExecutorFactory.get_or_create()
+        futures = []
+        for spec_id in reversed(groups.keys()):
+            bins = packer.pack_end(groups[spec_id], lambda m: m.manifest_length)
+            for b in bins:
+                futures.append(executor.submit(merge_bin, spec_id, b))
+
+        new_manifests: list[ManifestFile] = [f.result() for f in futures]
+        self._validate_files_counts(new_manifests, to_rewrite)
+
+        return new_manifests + to_keep
+
+
 class UpdateSnapshot:
     _transaction: Transaction
     _io: FileIO

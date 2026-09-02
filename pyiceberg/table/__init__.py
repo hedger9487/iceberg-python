@@ -86,7 +86,7 @@ from pyiceberg.table.update import (
     update_table_metadata,
 )
 from pyiceberg.table.update.schema import UpdateSchema
-from pyiceberg.table.update.snapshot import ManageSnapshots, UpdateSnapshot, _FastAppendFiles
+from pyiceberg.table.update.snapshot import ManageSnapshots, UpdateSnapshot, _FastAppendFiles, _RewriteManifests
 from pyiceberg.table.update.sorting import UpdateSortOrder
 from pyiceberg.table.update.spec import UpdateSpec
 from pyiceberg.table.update.statistics import UpdateStatistics
@@ -473,6 +473,27 @@ class Transaction:
             A new UpdateSnapshot
         """
         return UpdateSnapshot(self, io=self._table.io, branch=branch, snapshot_properties=snapshot_properties)
+
+    def rewrite_manifests(
+        self,
+        snapshot_properties: dict[str, str] = EMPTY_DICT,
+        branch: str | None = MAIN_BRANCH,
+    ) -> _RewriteManifests:
+        """Create a new _RewriteManifests to rewrite manifests for the table.
+
+        Args:
+            snapshot_properties: Custom snapshot properties.
+            branch: The branch to target for rewriting manifests.
+
+        Returns:
+            A new _RewriteManifests.
+        """
+        return _RewriteManifests(
+            transaction=self,
+            io=self._table.io,
+            snapshot_properties=snapshot_properties,
+            branch=branch,
+        )
 
     def update_statistics(self) -> UpdateStatistics:
         """
@@ -1597,6 +1618,30 @@ class Table:
            ms.create_tag(snapshot_id1, "Tag_A").create_tag(snapshot_id2, "Tag_B")
         """
         return ManageSnapshots(transaction=Transaction(self, autocommit=True))
+
+    def rewrite_manifests(
+        self,
+        snapshot_properties: dict[str, str] = EMPTY_DICT,
+        branch: str | None = MAIN_BRANCH,
+    ) -> _RewriteManifests:
+        """Shorthand to rewrite manifest files to optimize metadata.
+
+        Use table.rewrite_manifests().commit() to run the rewrite operation.
+        Use table.rewrite_manifests().rewrite_if(predicate).commit() to selectively rewrite matching manifests.
+
+        Args:
+            snapshot_properties: Custom snapshot properties.
+            branch: The branch to target for rewriting manifests.
+
+        Returns:
+            A new _RewriteManifests.
+        """
+        return _RewriteManifests(
+            transaction=Transaction(self, autocommit=True),
+            io=self.io,
+            snapshot_properties=snapshot_properties,
+            branch=branch,
+        )
 
     def update_statistics(self) -> UpdateStatistics:
         """

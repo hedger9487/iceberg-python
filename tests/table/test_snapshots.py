@@ -408,9 +408,25 @@ def test_merge_snapshot_summaries_overwrite_summary() -> None:
 
 
 def test_invalid_operation() -> None:
+    summary = Summary(Operation.APPEND)
+    object.__setattr__(summary, "operation", "unknown_operation")
     with pytest.raises(ValueError) as e:
-        update_snapshot_summaries(summary=Summary(Operation.REPLACE))
-    assert "Operation not implemented: Operation.REPLACE" in str(e.value)
+        update_snapshot_summaries(summary=summary)
+    assert "Operation not implemented: unknown_operation" in str(e.value)
+
+
+def test_replace_operation_snapshot_summary() -> None:
+    previous_summary = {
+        "total-data-files": "5",
+        "total-delete-files": "3",
+        "total-records": "7",
+        "total-files-size": "500",
+        "total-position-deletes": "6",
+        "total-equality-deletes": "4",
+    }
+    actual = update_snapshot_summaries(summary=Summary(Operation.REPLACE), previous_summary=previous_summary)
+    assert actual.operation == Operation.REPLACE
+    assert actual.additional_properties == previous_summary
 
 
 def test_invalid_type() -> None:
