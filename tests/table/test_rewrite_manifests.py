@@ -14,18 +14,20 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+from __future__ import annotations
+
 from pathlib import PosixPath
 
 import pyarrow as pa
 import pytest
 
 from pyiceberg.catalog import Catalog
+from pyiceberg.catalog.memory import InMemoryCatalog
 from pyiceberg.exceptions import NoSuchTableError, ValidationException
-from pyiceberg.manifest import ManifestEntryStatus
+from pyiceberg.manifest import ManifestEntryStatus, ManifestFile
 from pyiceberg.schema import Schema
 from pyiceberg.table.snapshots import Operation
 from pyiceberg.types import IntegerType, NestedField, StringType
-from tests.catalog.test_base import InMemoryCatalog
 
 
 @pytest.fixture
@@ -64,10 +66,12 @@ def test_rewrite_manifests_basic(catalog: Catalog) -> None:
     )
     tbl = catalog.create_table(identifier, schema=schema)
 
-    arrow_schema = pa.schema([
-        pa.field("id", pa.int32(), nullable=False),
-        pa.field("data", pa.string(), nullable=True),
-    ])
+    arrow_schema = pa.schema(
+        [
+            pa.field("id", pa.int32(), nullable=False),
+            pa.field("data", pa.string(), nullable=True),
+        ]
+    )
 
     tbl.append(pa.Table.from_pylist([{"id": 1, "data": "a"}], schema=arrow_schema))
     tbl.append(pa.Table.from_pylist([{"id": 2, "data": "b"}], schema=arrow_schema))
@@ -85,16 +89,17 @@ def test_rewrite_manifests_basic(catalog: Catalog) -> None:
 
     rewritten_snap = tbl.current_snapshot()
     assert rewritten_snap is not None
+    assert rewritten_snap.summary is not None
     assert rewritten_snap.summary.operation == Operation.REPLACE
     assert rewritten_snap.snapshot_id != current_snap.snapshot_id
     assert rewritten_snap.parent_snapshot_id == current_snap.snapshot_id
 
-    new_manifests = rewritten_snap.manifests(tbl.io)
-    assert len(new_manifests) == 1
-    assert new_manifests[0].manifest_path != initial_manifests[0].manifest_path
-
     rewritten_records = tbl.scan().to_arrow().to_pylist()
     assert rewritten_records == initial_records
+    assert rewritten_snap.summary["manifests-created"] == "1"
+    assert rewritten_snap.summary["manifests-replaced"] == "3"
+    assert rewritten_snap.summary["entries-processed"] == "3"
+    assert rewritten_snap.summary["manifests-kept"] == "0"
 
 
 def test_rewrite_manifests_via_maintenance(catalog: Catalog) -> None:
@@ -106,20 +111,25 @@ def test_rewrite_manifests_via_maintenance(catalog: Catalog) -> None:
     )
     tbl = catalog.create_table(identifier, schema=schema)
 
-    arrow_schema = pa.schema([
-        pa.field("id", pa.int32(), nullable=False),
-        pa.field("data", pa.string(), nullable=True),
-    ])
+    arrow_schema = pa.schema(
+        [
+            pa.field("id", pa.int32(), nullable=False),
+            pa.field("data", pa.string(), nullable=True),
+        ]
+    )
 
     tbl.append(pa.Table.from_pylist([{"id": 1, "data": "a"}], schema=arrow_schema))
     tbl.append(pa.Table.from_pylist([{"id": 2, "data": "b"}], schema=arrow_schema))
 
-    assert len(tbl.current_snapshot().manifests(tbl.io)) == 2
+    current_snap = tbl.current_snapshot()
+    assert current_snap is not None
+    assert len(current_snap.manifests(tbl.io)) == 2
 
     tbl.maintenance.rewrite_manifests().commit()
 
     snap = tbl.current_snapshot()
     assert snap is not None
+    assert snap.summary is not None
     assert snap.summary.operation == Operation.REPLACE
     assert len(snap.manifests(tbl.io)) == 1
     assert sorted(tbl.scan().to_arrow().to_pylist(), key=lambda r: r["id"]) == [{"id": 1, "data": "a"}, {"id": 2, "data": "b"}]
@@ -134,10 +144,12 @@ def test_rewrite_manifests_preserves_sequence_numbers(catalog: Catalog) -> None:
     )
     tbl = catalog.create_table(identifier, schema=schema, properties={"format-version": "2"})
 
-    arrow_schema = pa.schema([
-        pa.field("id", pa.int32(), nullable=False),
-        pa.field("data", pa.string(), nullable=True),
-    ])
+    arrow_schema = pa.schema(
+        [
+            pa.field("id", pa.int32(), nullable=False),
+            pa.field("data", pa.string(), nullable=True),
+        ]
+    )
 
     tbl.append(pa.Table.from_pylist([{"id": 1, "data": "a"}], schema=arrow_schema))
     tbl.append(pa.Table.from_pylist([{"id": 2, "data": "b"}], schema=arrow_schema))
@@ -175,10 +187,12 @@ def test_rewrite_manifests_with_predicate(catalog: Catalog) -> None:
     )
     tbl = catalog.create_table(identifier, schema=schema)
 
-    arrow_schema = pa.schema([
-        pa.field("id", pa.int32(), nullable=False),
-        pa.field("data", pa.string(), nullable=True),
-    ])
+    arrow_schema = pa.schema(
+        [
+            pa.field("id", pa.int32(), nullable=False),
+            pa.field("data", pa.string(), nullable=True),
+        ]
+    )
 
     tbl.append(pa.Table.from_pylist([{"id": 1, "data": "a"}], schema=arrow_schema))
     snap1 = tbl.current_snapshot()
@@ -221,10 +235,12 @@ def test_rewrite_manifests_branch(catalog: Catalog) -> None:
     )
     tbl = catalog.create_table(identifier, schema=schema)
 
-    arrow_schema = pa.schema([
-        pa.field("id", pa.int32(), nullable=False),
-        pa.field("data", pa.string(), nullable=True),
-    ])
+    arrow_schema = pa.schema(
+        [
+            pa.field("id", pa.int32(), nullable=False),
+            pa.field("data", pa.string(), nullable=True),
+        ]
+    )
 
     tbl.append(pa.Table.from_pylist([{"id": 1, "data": "a"}], schema=arrow_schema))
     tbl.append(pa.Table.from_pylist([{"id": 2, "data": "b"}], schema=arrow_schema))
@@ -237,8 +253,10 @@ def test_rewrite_manifests_branch(catalog: Catalog) -> None:
 
     tbl.rewrite_manifests(branch=branch).commit()
 
-    assert tbl.current_snapshot().snapshot_id == initial_snap.snapshot_id
-    assert len(tbl.current_snapshot().manifests(tbl.io)) == 2
+    current_snap = tbl.current_snapshot()
+    assert current_snap is not None
+    assert current_snap.snapshot_id == initial_snap.snapshot_id
+    assert len(current_snap.manifests(tbl.io)) == 2
 
     branch_snap = tbl.snapshot_by_name(branch)
     assert branch_snap is not None
@@ -259,10 +277,12 @@ def test_rewrite_manifests_in_transaction(catalog: Catalog) -> None:
     )
     tbl = catalog.create_table(identifier, schema=schema)
 
-    arrow_schema = pa.schema([
-        pa.field("id", pa.int32(), nullable=False),
-        pa.field("data", pa.string(), nullable=True),
-    ])
+    arrow_schema = pa.schema(
+        [
+            pa.field("id", pa.int32(), nullable=False),
+            pa.field("data", pa.string(), nullable=True),
+        ]
+    )
 
     tbl.append(pa.Table.from_pylist([{"id": 1, "data": "a"}], schema=arrow_schema))
     tbl.append(pa.Table.from_pylist([{"id": 2, "data": "b"}], schema=arrow_schema))
@@ -272,6 +292,7 @@ def test_rewrite_manifests_in_transaction(catalog: Catalog) -> None:
 
     snap = tbl.current_snapshot()
     assert snap is not None
+    assert snap.summary is not None
     assert snap.summary.operation == Operation.REPLACE
     assert len(snap.manifests(tbl.io)) == 1
     assert sorted(tbl.scan().to_arrow().to_pylist(), key=lambda r: r["id"]) == [{"id": 1, "data": "a"}, {"id": 2, "data": "b"}]
@@ -290,20 +311,25 @@ def test_rewrite_manifests_partitioned_table(catalog: Catalog) -> None:
     spec = PartitionSpec(PartitionField(source_id=2, field_id=1000, transform=IdentityTransform(), name="category"))
     tbl = catalog.create_table(identifier, schema=schema, partition_spec=spec)
 
-    arrow_schema = pa.schema([
-        pa.field("id", pa.int32(), nullable=False),
-        pa.field("category", pa.string(), nullable=True),
-    ])
+    arrow_schema = pa.schema(
+        [
+            pa.field("id", pa.int32(), nullable=False),
+            pa.field("category", pa.string(), nullable=True),
+        ]
+    )
 
     tbl.append(pa.Table.from_pylist([{"id": 1, "category": "cat_a"}, {"id": 2, "category": "cat_b"}], schema=arrow_schema))
     tbl.append(pa.Table.from_pylist([{"id": 3, "category": "cat_a"}], schema=arrow_schema))
 
-    assert len(tbl.current_snapshot().manifests(tbl.io)) == 2
+    current_snap = tbl.current_snapshot()
+    assert current_snap is not None
+    assert len(current_snap.manifests(tbl.io)) == 2
 
     tbl.rewrite_manifests().commit()
 
     snap = tbl.current_snapshot()
     assert snap is not None
+    assert snap.summary is not None
     assert snap.summary.operation == Operation.REPLACE
     assert len(snap.manifests(tbl.io)) == 1
 
@@ -327,24 +353,29 @@ def test_rewrite_manifests_file_count_mismatch_raises(catalog: Catalog, monkeypa
     )
     tbl = catalog.create_table(identifier, schema=schema)
 
-    arrow_schema = pa.schema([
-        pa.field("id", pa.int32(), nullable=False),
-        pa.field("data", pa.string(), nullable=True),
-    ])
+    arrow_schema = pa.schema(
+        [
+            pa.field("id", pa.int32(), nullable=False),
+            pa.field("data", pa.string(), nullable=True),
+        ]
+    )
 
     tbl.append(pa.Table.from_pylist([{"id": 1, "data": "a"}], schema=arrow_schema))
 
-    from pyiceberg.table.update.snapshot import _RewriteManifests
+    from pyiceberg.table.update.snapshot import RewriteManifests
 
-    orig_create_manifest = _RewriteManifests._create_manifest
+    orig_create_manifest = RewriteManifests._create_manifest
 
-    def buggy_create_manifest(self: _RewriteManifests, spec_id: int, manifest_bin: list) -> ManifestFile:
-        manifest = orig_create_manifest(self, spec_id, manifest_bin)
+    def buggy_create_manifest(
+        self: RewriteManifests, spec_id: int, manifest_bin: list[ManifestFile]
+    ) -> tuple[ManifestFile | None, int]:
+        manifest, count = orig_create_manifest(self, spec_id, manifest_bin)
+        assert manifest is not None
         # Artificially alter existing_files_count (index 8) to simulate file count mismatch
         manifest._data[8] = (manifest._data[8] or 0) + 1
-        return manifest
+        return manifest, count
 
-    monkeypatch.setattr(_RewriteManifests, "_create_manifest", buggy_create_manifest)
+    monkeypatch.setattr(RewriteManifests, "_create_manifest", buggy_create_manifest)
 
     with pytest.raises(ValidationException, match="Replaced and created manifests must have the same number of active files"):
         tbl.rewrite_manifests().commit()

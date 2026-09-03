@@ -876,7 +876,7 @@ class _OverwriteFiles(_SnapshotProducer["_OverwriteFiles"]):
             raise ValidationException(f"Missing required files to delete: {', '.join(sorted(missing))}")
 
 
-class _RewriteManifests(_SnapshotProducer["_RewriteManifests"]):
+class RewriteManifests(_SnapshotProducer["RewriteManifests"]):
     """Rewrites manifest files for a table to optimize metadata.
 
     This produces a REPLACE snapshot.
@@ -884,6 +884,10 @@ class _RewriteManifests(_SnapshotProducer["_RewriteManifests"]):
 
     _manifest_predicate: Callable[[ManifestFile], bool] | None
     _target_size_bytes: int
+    _manifests_created: int
+    _manifests_replaced: int
+    _manifests_kept: int
+    _entries_processed: int
 
     def __init__(
         self,
@@ -897,6 +901,10 @@ class _RewriteManifests(_SnapshotProducer["_RewriteManifests"]):
 
         super().__init__(Operation.REPLACE, transaction, io, commit_uuid, snapshot_properties, branch)
         self._manifest_predicate = None
+        self._manifests_created = 0
+        self._manifests_replaced = 0
+        self._manifests_kept = 0
+        self._entries_processed = 0
         table_properties = self._transaction.table_metadata.properties
         self._target_size_bytes = property_as_int(
             table_properties,
@@ -904,20 +912,24 @@ class _RewriteManifests(_SnapshotProducer["_RewriteManifests"]):
             TableProperties.MANIFEST_TARGET_SIZE_BYTES_DEFAULT,
         )  # type: ignore
 
-    def rewrite_if(self, predicate: Callable[[ManifestFile], bool]) -> _RewriteManifests:
+    def rewrite_if(self, predicate: Callable[[ManifestFile], bool]) -> RewriteManifests:
         """Filter which manifests should be rewritten.
 
         Args:
             predicate: A function that takes a ManifestFile and returns True if it should be rewritten.
 
         Returns:
-            This _RewriteManifests instance for method chaining.
+            This RewriteManifests instance for method chaining.
         """
         self._manifest_predicate = predicate
         return self
 
     def _validate_concurrency(self) -> None:
-        """Validate concurrency for rewrite manifests."""
+        """Validate concurrency for rewrite manifests.
+
+        RewriteManifests does not produce new data/delete files, so it relies on table-level
+        optimistic concurrency control (AssertRefSnapshotId) and automatic retry in the Transaction.
+        """
         if self._parent_snapshot_id is None:
             raise ValidationException("Cannot rewrite manifests on a table with no snapshots")
 
@@ -935,14 +947,21 @@ class _RewriteManifests(_SnapshotProducer["_RewriteManifests"]):
     def _deleted_entries(self) -> list[ManifestEntry]:
         return []
 
-    def _create_manifest(self, spec_id: int, manifest_bin: list[ManifestFile]) -> ManifestFile:
-        with self.new_manifest_writer(spec=self.spec(spec_id)) as writer:
-            for manifest in manifest_bin:
-                for entry in self.fetch_manifest_entry(manifest=manifest, discard_deleted=False):
-                    if entry.status != ManifestEntryStatus.DELETED:
-                        writer.existing(entry)
+    def _create_manifest(self, spec_id: int, manifest_bin: list[ManifestFile]) -> tuple[ManifestFile | None, int]:
+        live_entries: list[ManifestEntry] = []
+        for manifest in manifest_bin:
+            for entry in self.fetch_manifest_entry(manifest=manifest, discard_deleted=False):
+                if entry.status != ManifestEntryStatus.DELETED:
+                    live_entries.append(entry)
 
-        return writer.to_manifest_file()
+        if not live_entries:
+            return None, 0
+
+        with self.new_manifest_writer(spec=self.spec(spec_id)) as writer:
+            for entry in live_entries:
+                writer.existing(entry)
+
+        return writer.to_manifest_file(), len(live_entries)
 
     def _validate_files_counts(self, created_manifests: list[ManifestFile], replaced_manifests: list[ManifestFile]) -> None:
         def active_files_count(manifests: list[ManifestFile]) -> int:
@@ -958,6 +977,16 @@ class _RewriteManifests(_SnapshotProducer["_RewriteManifests"]):
                 f"Replaced and created manifests must have the same number of active files: "
                 f"{created_files_count} (new), {replaced_files_count} (old)"
             )
+
+    def _summary(self, snapshot_properties: dict[str, str] = EMPTY_DICT) -> Summary:
+        summary_props = {
+            "manifests-created": str(self._manifests_created),
+            "manifests-replaced": str(self._manifests_replaced),
+            "manifests-kept": str(self._manifests_kept),
+            "entries-processed": str(self._entries_processed),
+            **snapshot_properties,
+        }
+        return super()._summary(summary_props)
 
     def _process_manifests(self, manifests: list[ManifestFile]) -> list[ManifestFile]:
         """Process and rewrite manifests matching predicate."""
@@ -981,7 +1010,7 @@ class _RewriteManifests(_SnapshotProducer["_RewriteManifests"]):
 
         packer: ListPacker[ManifestFile] = ListPacker(target_weight=self._target_size_bytes, lookback=1, largest_bin_first=False)
 
-        def merge_bin(spec_id: int, manifest_bin: list[ManifestFile]) -> ManifestFile:
+        def merge_bin(spec_id: int, manifest_bin: list[ManifestFile]) -> tuple[ManifestFile | None, int]:
             return self._create_manifest(spec_id, manifest_bin)
 
         executor = ExecutorFactory.get_or_create()
@@ -991,8 +1020,20 @@ class _RewriteManifests(_SnapshotProducer["_RewriteManifests"]):
             for b in bins:
                 futures.append(executor.submit(merge_bin, spec_id, b))
 
-        new_manifests: list[ManifestFile] = [f.result() for f in futures]
+        new_manifests: list[ManifestFile] = []
+        total_entries_processed = 0
+        for f in futures:
+            manifest_file, entries_count = f.result()
+            if manifest_file is not None:
+                new_manifests.append(manifest_file)
+            total_entries_processed += entries_count
+
         self._validate_files_counts(new_manifests, to_rewrite)
+
+        self._manifests_created = len(new_manifests)
+        self._manifests_replaced = len(to_rewrite)
+        self._manifests_kept = len(to_keep)
+        self._entries_processed = total_entries_processed
 
         return new_manifests + to_keep
 

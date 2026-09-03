@@ -86,7 +86,7 @@ from pyiceberg.table.update import (
     update_table_metadata,
 )
 from pyiceberg.table.update.schema import UpdateSchema
-from pyiceberg.table.update.snapshot import ManageSnapshots, UpdateSnapshot, _FastAppendFiles, _RewriteManifests
+from pyiceberg.table.update.snapshot import ManageSnapshots, RewriteManifests, UpdateSnapshot, _FastAppendFiles
 from pyiceberg.table.update.sorting import UpdateSortOrder
 from pyiceberg.table.update.spec import UpdateSpec
 from pyiceberg.table.update.statistics import UpdateStatistics
@@ -478,17 +478,17 @@ class Transaction:
         self,
         snapshot_properties: dict[str, str] = EMPTY_DICT,
         branch: str | None = MAIN_BRANCH,
-    ) -> _RewriteManifests:
-        """Create a new _RewriteManifests to rewrite manifests for the table.
+    ) -> RewriteManifests:
+        """Create a new RewriteManifests to rewrite manifests for the table.
 
         Args:
             snapshot_properties: Custom snapshot properties.
             branch: The branch to target for rewriting manifests.
 
         Returns:
-            A new _RewriteManifests.
+            A new RewriteManifests.
         """
-        return _RewriteManifests(
+        return RewriteManifests(
             transaction=self,
             io=self._table.io,
             snapshot_properties=snapshot_properties,
@@ -1623,7 +1623,7 @@ class Table:
         self,
         snapshot_properties: dict[str, str] = EMPTY_DICT,
         branch: str | None = MAIN_BRANCH,
-    ) -> _RewriteManifests:
+    ) -> RewriteManifests:
         """Shorthand to rewrite manifest files to optimize metadata.
 
         Use table.rewrite_manifests().commit() to run the rewrite operation.
@@ -1634,9 +1634,9 @@ class Table:
             branch: The branch to target for rewriting manifests.
 
         Returns:
-            A new _RewriteManifests.
+            A new RewriteManifests.
         """
-        return _RewriteManifests(
+        return RewriteManifests(
             transaction=Transaction(self, autocommit=True),
             io=self.io,
             snapshot_properties=snapshot_properties,

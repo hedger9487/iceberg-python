@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from pyiceberg.table.refs import MAIN_BRANCH
 from pyiceberg.typedef import EMPTY_DICT
 
 logger = logging.getLogger(__name__)
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from pyiceberg.table import Table
-    from pyiceberg.table.update.snapshot import ExpireSnapshots, _RewriteManifests
+    from pyiceberg.table.update.snapshot import ExpireSnapshots, RewriteManifests
 
 
 class MaintenanceTable:
@@ -49,24 +50,23 @@ class MaintenanceTable:
     def rewrite_manifests(
         self,
         snapshot_properties: dict[str, str] = EMPTY_DICT,
-        branch: str | None = None,
-    ) -> _RewriteManifests:
-        """Return a _RewriteManifests builder for rewriting manifests.
+        branch: str | None = MAIN_BRANCH,
+    ) -> RewriteManifests:
+        """Return a RewriteManifests builder for rewriting manifests.
 
         Args:
             snapshot_properties: Custom snapshot properties.
             branch: The branch to target for rewriting manifests.
 
         Returns:
-            _RewriteManifests builder for configuring and executing manifest rewriting.
+            RewriteManifests builder for configuring and executing manifest rewriting.
         """
         from pyiceberg.table import Transaction
-        from pyiceberg.table.refs import MAIN_BRANCH
-        from pyiceberg.table.update.snapshot import _RewriteManifests
+        from pyiceberg.table.update.snapshot import RewriteManifests
 
-        return _RewriteManifests(
+        return RewriteManifests(
             transaction=Transaction(self.tbl, autocommit=True),
             io=self.tbl.io,
             snapshot_properties=snapshot_properties,
-            branch=branch or MAIN_BRANCH,
+            branch=branch,
         )
